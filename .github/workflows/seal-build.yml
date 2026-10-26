@@ -1,0 +1,70 @@
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Surefire -Dtest selector; empty runs the full suite"
+        required: false
+        default: ""
+
+jobs:
+  build-osx-x86_64:
+    name: build-osx-x86_64
+    # netty-transport-native-kqueue publishes an osx-x86_64 classifier jar, built
+    # natively by hawtjni on an Intel Mac (os-maven-plugin -> os.detected.arch=x86_64).
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up JDK 8 (release Build-Jdk 1.8.0_232)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "8"
+
+      - name: Install native build tools (hawtjni autotools)
+        run: brew install autoconf automake libtool
+
+      - name: Build reactor dependencies (no tests)
+        run: ./mvnw -B -V -ntp clean install -pl transport-native-kqueue -am -DskipTests -Dcheckstyle.skip=true
+
+      - name: Test transport-native-unix-common + transport-native-kqueue
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./mvnw -B -ntp install -pl transport-native-unix-common,transport-native-unix-common-tests,transport-native-kqueue \
+              -Dcheckstyle.skip=true -Dio.netty.testsuite.badHost=netty.io \
+              -Dtest=${{ inputs.test-filter }} -DfailIfNoTests=false
+          else
+            ./mvnw -B -ntp install -pl transport-native-unix-common,transport-native-unix-common-tests,transport-native-kqueue \
+              -Dcheckstyle.skip=true -Dio.netty.testsuite.badHost=netty.io
+          fi
+
+      - name: Print skipped tests with reasons
+        if: always()
+        run: |
+          for f in transport-native-*/target/surefire-reports/TEST-*.xml; do
+            [ -f "$f" ] || continue
+            python3 - "$f" <<'EOF'
+          import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          for tc in root.iter('testcase'):
+              s = tc.find('skipped')
+              if s is not None:
+                  print("SKIPPED: %s.%s -- %s" % (tc.get('classname'), tc.get('name'), s.get('message') or (s.text or '').strip() or 'no message'))
+          EOF
+          done
+
+      - name: Upload kqueue jars
+        uses: actions/upload-artifact@v4
+        with:
+          name: netty-transport-native-kqueue-jars
+          path: |
+            transport-native-kqueue/target/netty-transport-native-kqueue-*.jar
+            !transport-native-kqueue/target/*-sources.jar
+            !transport-native-kqueue/target/*-test-sources.jar
+            !transport-native-kqueue/target/*-javadoc.jar
+          if-no-files-found: error
